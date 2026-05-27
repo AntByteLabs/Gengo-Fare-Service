@@ -29,22 +29,35 @@ import (
 const bumpChannel = "app:config:bumped"
 
 // VehicleRateOverride captures the subset of fare math that admins can tune
-// from /v1/admin/app-config. Fields are in NPR (rupees) — callers convert to
-// paisa as needed.
+// from /v1/admin/app-config. Pointers (vs plain int64) so we can tell
+// "admin deliberately set 0" from "admin didn't touch this field" — a
+// previous version used `> 0` guards which silently ignored explicit zero
+// values. Fields are NPR; callers convert to paisa as needed.
 type VehicleRateOverride struct {
-	BaseFareNPR   int64
-	RatePerKm     int64
-	RatePerMinute int64
+	BaseFareNPR     *int64
+	RatePerKm       *int64
+	RatePerMinute   *int64
+	MinFareNPR      *int64
+	BookingFeePaisa *int64
 }
 
 // Snapshot is an immutable view of the config at the time it was fetched.
 // Callers receive a pointer to one and treat it as read-only; writes happen
 // only inside the Client when a new poll succeeds.
 type Snapshot struct {
-	Version       int
-	MinFareNPR    int64
-	VehicleRates  map[string]VehicleRateOverride
-	FetchedAt     time.Time
+	Version              int
+	MinFareNPR           int64
+	BookingFeePaisa      int64
+	TaxRatePercent       float64
+	NightSurchargePaisa  int64
+	AirportSurchargePaisa int64
+	// Pickup-leg charge. PickupFareNPRPerKm is in NPR/km (multiply by km to
+	// get NPR, then ×100 for paisa). PickupFreeKm is the allowance below
+	// which no pickup fee is charged.
+	PickupFareNPRPerKm   float64
+	PickupFreeKm         float64
+	VehicleRates         map[string]VehicleRateOverride
+	FetchedAt            time.Time
 }
 
 // Client polls app-config-svc on a fixed interval and caches the most-recent
@@ -178,12 +191,23 @@ func (c *Client) refresh(ctx context.Context) error {
 		Data    struct {
 			Version int `json:"version"`
 			Fares   struct {
-				MinFareNPR int64 `json:"minFareNPR"`
-				Vehicles   []struct {
-					ID            string `json:"id"`
-					BaseFareNPR   int64  `json:"baseFareNPR"`
-					RatePerKm     int64  `json:"ratePerKm"`
-					RatePerMinute int64  `json:"ratePerMinute"`
+				MinFareNPR            int64   `json:"minFareNPR"`
+				BookingFeePaisa       int64   `json:"bookingFeePaisa"`
+				TaxRatePercent        float64 `json:"taxRatePercent"`
+				NightSurchargePaisa   int64   `json:"nightSurchargePaisa"`
+				AirportSurchargePaisa int64   `json:"airportSurchargePaisa"`
+				PickupFareNPRPerKm    float64 `json:"pickupFareNPRPerKm"`
+				PickupFreeKm          float64 `json:"pickupFreeKm"`
+				Vehicles              []struct {
+					ID              string `json:"id"`
+					// Pointers so absent JSON keys decode to nil — admin
+					// patches one field at a time and we mustn't treat a
+					// missing key as "set to 0".
+					BaseFareNPR     *int64 `json:"baseFareNPR"`
+					RatePerKm       *int64 `json:"ratePerKm"`
+					RatePerMinute   *int64 `json:"ratePerMinute"`
+					MinFareNPR      *int64 `json:"minFareNPR"`
+					BookingFeePaisa *int64 `json:"bookingFeePaisa"`
 				} `json:"vehicles"`
 			} `json:"fares"`
 		} `json:"data"`
@@ -198,17 +222,29 @@ func (c *Client) refresh(ctx context.Context) error {
 	rates := make(map[string]VehicleRateOverride, len(envelope.Data.Fares.Vehicles))
 	for _, v := range envelope.Data.Fares.Vehicles {
 		rates[v.ID] = VehicleRateOverride{
-			BaseFareNPR:   v.BaseFareNPR,
-			RatePerKm:     v.RatePerKm,
-			RatePerMinute: v.RatePerMinute,
+			BaseFareNPR:     v.BaseFareNPR,
+			RatePerKm:       v.RatePerKm,
+			RatePerMinute:   v.RatePerMinute,
+			MinFareNPR:      v.MinFareNPR,
+			BookingFeePaisa: v.BookingFeePaisa,
 		}
 	}
+	// Range-loop variable v already a struct copy; we keep the pointer
+	// fields straight through. The map's value type is VehicleRateOverride
+	// whose pointer fields point into envelope's heap-allocated decoded
+	// values — those outlive this function via the snapshot we store below.
 
 	snap := &Snapshot{
-		Version:      envelope.Data.Version,
-		MinFareNPR:   envelope.Data.Fares.MinFareNPR,
-		VehicleRates: rates,
-		FetchedAt:    time.Now(),
+		Version:               envelope.Data.Version,
+		MinFareNPR:            envelope.Data.Fares.MinFareNPR,
+		BookingFeePaisa:       envelope.Data.Fares.BookingFeePaisa,
+		TaxRatePercent:        envelope.Data.Fares.TaxRatePercent,
+		NightSurchargePaisa:   envelope.Data.Fares.NightSurchargePaisa,
+		AirportSurchargePaisa: envelope.Data.Fares.AirportSurchargePaisa,
+		PickupFareNPRPerKm:    envelope.Data.Fares.PickupFareNPRPerKm,
+		PickupFreeKm:          envelope.Data.Fares.PickupFreeKm,
+		VehicleRates:          rates,
+		FetchedAt:             time.Now(),
 	}
 	c.mu.Lock()
 	prev := c.current

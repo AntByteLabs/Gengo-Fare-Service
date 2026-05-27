@@ -5,6 +5,7 @@ import (
 	"math"
 	"time"
 
+	"github.com/gengo/fare-svc/internal/config"
 	"github.com/gengo/fare-svc/internal/domain"
 )
 
@@ -33,12 +34,14 @@ const (
 // ValidateRequest checks that the FareRequest fields are sensible before any
 // computation is performed. It returns a descriptive error on the first
 // violated constraint.
+//
+// VehicleType is intentionally loose: any non-empty lowercase id is
+// accepted. Unknown ids fall back to bike defaults in resolveRates, which
+// keeps the fare service forward-compatible with admin-added vehicles
+// (e.g. "scooter", "premium", "xl") without redeploying.
 func ValidateRequest(req domain.FareRequest) error {
-	switch req.VehicleType {
-	case domain.VehicleBike, domain.VehicleCar, domain.VehicleElectric, domain.VehicleAuto:
-		// valid
-	default:
-		return fmt.Errorf("vehicleType %q is not supported; must be one of bike, car, electric, auto", req.VehicleType)
+	if req.VehicleType == "" {
+		return fmt.Errorf("vehicleType must not be empty")
 	}
 
 	if req.DistanceM < 0 {
@@ -54,8 +57,14 @@ func ValidateRequest(req domain.FareRequest) error {
 // ComputeFare computes a complete fare estimate for the given request.
 // now is accepted as a parameter so night-surcharge logic is fully testable
 // without mocking time.Now.
+//
+// Admin-configured overrides (from app-config-svc) take precedence over the
+// bundled defaults: every BaseFare / PerKm / PerMin / MinFare value can be
+// adjusted live without a deploy. When the snapshot is missing (e.g. the
+// service just started and the first poll hasn't landed), we fall through
+// to domain.VehicleRates so fares are never zero.
 func ComputeFare(req domain.FareRequest, now time.Time) domain.FareEstimate {
-	rates := domain.VehicleRates[req.VehicleType]
+	rates := resolveRates(req.VehicleType)
 
 	// --- Distance ---
 	distanceM := req.DistanceM
@@ -79,7 +88,20 @@ func ComputeFare(req domain.FareRequest, now time.Time) domain.FareEstimate {
 	distanceFare := int64(chargeableKm * float64(rates.PerKmRate))
 	timeFare := int64(durationMin * float64(rates.PerMinRate))
 
-	subtotal := rates.BaseFare + distanceFare + timeFare
+	// Pickup-leg fare — driver's deadhead km. Computed only when the
+	// caller supplied a non-zero DriverPickupDistanceM (typically once
+	// a driver is matched and we know their position). At rider-side
+	// estimate time this is zero, so the line stays out of the breakdown.
+	var pickupLegFare int64
+	if req.DriverPickupDistanceM > 0 {
+		if snap := configSnapshot(); snap != nil && snap.PickupFareNPRPerKm > 0 {
+			pickupKm := float64(req.DriverPickupDistanceM) / 1000.0
+			chargeablePickupKm := math.Max(0, pickupKm-snap.PickupFreeKm)
+			pickupLegFare = int64(chargeablePickupKm * snap.PickupFareNPRPerKm * 100)
+		}
+	}
+
+	subtotal := rates.BaseFare + distanceFare + timeFare + pickupLegFare
 
 	// --- Night surcharge (NPT = UTC+5:45) ---
 	nptLoc := time.FixedZone("NPT", 5*3600+45*60)
@@ -88,7 +110,14 @@ func ComputeFare(req domain.FareRequest, now time.Time) domain.FareEstimate {
 
 	var nightSurcharge int64
 	if hour >= nightStartHour || hour < nightEndHour {
-		nightSurcharge = int64(float64(subtotal) * nightSurchargeRate)
+		// Admin-configured flat amount (paisa) trumps the bundled 20%
+		// multiplier when set. Lets ops apply a fixed "after-hours" fee
+		// without rebuilding the service.
+		if snap := configSnapshot(); snap != nil && snap.NightSurchargePaisa > 0 {
+			nightSurcharge = snap.NightSurchargePaisa
+		} else {
+			nightSurcharge = int64(float64(subtotal) * nightSurchargeRate)
+		}
 	}
 
 	// --- Surge (currently static 1.0; kept as a hook for future dynamic surge) ---
@@ -100,8 +129,12 @@ func ComputeFare(req domain.FareRequest, now time.Time) domain.FareEstimate {
 	preBooking := int64(math.Max(float64(int64(surgedSubtotal)), float64(rates.MinFare)))
 	total := preBooking + rates.BookingFee
 
-	// --- Tax (13% VAT) ---
-	tax := int64(math.Floor(float64(total) * taxRate))
+	// --- Tax — admin can override the 13% default per market ---
+	effectiveTaxRate := taxRate
+	if snap := configSnapshot(); snap != nil && snap.TaxRatePercent > 0 {
+		effectiveTaxRate = snap.TaxRatePercent / 100
+	}
+	tax := int64(math.Floor(float64(total) * effectiveTaxRate))
 	total = total + tax
 
 	// --- Round to nearest 100 paisa ---
@@ -112,6 +145,7 @@ func ComputeFare(req domain.FareRequest, now time.Time) domain.FareEstimate {
 		DistanceFare:     distanceFare,
 		TimeFare:         timeFare,
 		WaitingFare:      0,
+		PickupLegFare:    pickupLegFare,
 		Surge:            surgeAmount,
 		NightSurcharge:   nightSurcharge,
 		AirportSurcharge: 0,
@@ -129,6 +163,79 @@ func ComputeFare(req domain.FareRequest, now time.Time) domain.FareEstimate {
 		SurgeMultiplier: surgeMultiplier,
 		FareBreakdown:   breakdown,
 	}
+}
+
+// configSnapshot is a small accessor for the admin-configured snapshot so
+// surcharge / tax code can read fields without re-implementing the nil
+// guards every time.
+func configSnapshot() *config.Snapshot {
+	c := configClientHolder.Load()
+	if c == nil {
+		return nil
+	}
+	return c.Snapshot()
+}
+
+// resolveRates merges the admin-configured snapshot over the bundled
+// defaults. The snapshot is read via the package-level configClientHolder
+// (populated in main.go); when it's nil — or doesn't have an entry for
+// this vehicle — we return the default unchanged. We DO NOT mutate the
+// default map.
+//
+// For unknown vehicle ids (admin added a new vehicle like "scooter" that
+// isn't in the bundled domain.VehicleRates map), we fall back to the
+// bike default rate so the fare is never computed against an all-zero
+// rate row. If the admin snapshot carries an override for the unknown
+// id, those overrides still apply on top.
+func resolveRates(vt domain.VehicleType) domain.VehicleRate {
+	defaults, hasDefaults := domain.VehicleRates[vt]
+	if !hasDefaults {
+		// Unknown id (e.g. admin-added "scooter"). Seed with bike defaults
+		// so the rate row has sensible non-zero values before any admin
+		// overrides are layered on.
+		defaults = domain.VehicleRates[domain.VehicleBike]
+	}
+	c := configClientHolder.Load()
+	if c == nil {
+		return defaults
+	}
+	snap := c.Snapshot()
+	if snap == nil {
+		return defaults
+	}
+	override, ok := snap.VehicleRates[string(vt)]
+	if !ok {
+		return defaults
+	}
+	out := defaults
+	// All overrides are in NPR; convert to paisa. Zero means "not set by
+	// admin" so we keep the default (the AppConfig JSON Schema would never
+	// emit a 0 for a positive-valued field anyway, but be defensive).
+	// Nil pointer = admin didn't touch this field → keep default.
+	// Non-nil pointer = admin explicitly set the value, INCLUDING zero.
+	// This is the only way "perMinute = 0" (no time charge) can survive.
+	if override.BaseFareNPR != nil {
+		out.BaseFare = *override.BaseFareNPR * 100
+	}
+	if override.RatePerKm != nil {
+		out.PerKmRate = *override.RatePerKm * 100
+	}
+	if override.RatePerMinute != nil {
+		out.PerMinRate = *override.RatePerMinute * 100
+	}
+	// Per-vehicle minimum wins over global. Global wins over bundled default.
+	if override.MinFareNPR != nil {
+		out.MinFare = *override.MinFareNPR * 100
+	} else if snap.MinFareNPR > 0 {
+		out.MinFare = snap.MinFareNPR * 100
+	}
+	// Booking fee — per-vehicle override (paisa, already), then global, then default.
+	if override.BookingFeePaisa != nil {
+		out.BookingFee = *override.BookingFeePaisa
+	} else if snap.BookingFeePaisa > 0 {
+		out.BookingFee = snap.BookingFeePaisa
+	}
+	return out
 }
 
 // haversineM returns the great-circle distance in metres between two points.

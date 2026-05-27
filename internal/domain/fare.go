@@ -67,6 +67,11 @@ type FareRequest struct {
 	DistanceM int64 `json:"distanceM"`
 	// DurationS is optional. When zero, a default estimate is derived.
 	DurationS int64 `json:"durationS"`
+	// DriverPickupDistanceM is the deadhead distance the driver rides
+	// alone to reach the pickup. Optional — zero at request-ride time
+	// (no driver matched yet). When > 0, the fare gains a pickup-leg
+	// line item; the proceeds are paid to the driver.
+	DriverPickupDistanceM int64 `json:"driverPickupDistanceM,omitempty"`
 }
 
 // FareBreakdown contains every line-item of the fare computation.
@@ -76,6 +81,9 @@ type FareBreakdown struct {
 	DistanceFare     int64 `json:"distanceFare"`
 	TimeFare         int64 `json:"timeFare"`
 	WaitingFare      int64 `json:"waitingFare"`
+	/** Pickup-leg charge — driver's deadhead km to the customer/parcel.
+	 *  Zero when no driver-pickup distance was supplied. Goes 100% to driver. */
+	PickupLegFare    int64 `json:"pickupLegFare"`
 	Surge            int64 `json:"surge"`
 	NightSurcharge   int64 `json:"nightSurcharge"`
 	AirportSurcharge int64 `json:"airportSurcharge"`
